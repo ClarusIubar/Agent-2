@@ -27,7 +27,7 @@ github: github.com/aaravshah1311
   <strong><i>Sponsored by</i></strong><br><br>
   <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">
     <picture>
-      <img src="pic/Fluxion_AI_English_Partner_Banner_v3.png" width="100%">
+      <img src="pic/FluxionAI-world-banner-get-3-credit.png" width="100%">
     </picture>
   </a>
 </p>
