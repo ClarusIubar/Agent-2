@@ -7,8 +7,9 @@ github: github.com/aaravshah1311
 <h1 align="center">⚡ Agent-2</h1>
 
 <p align="center">
-  <em>A self-hosted autonomous AI agent powered by Google Gemini —<br>
-  coding assistant, terminal agent, security tester and persistent memory in one interface.</em>
+  <em>An autonomous AI agentic harness built to code anything, automate terminals, perform cybersecurity tasks, and execute complex real-world workflows with minimal human intervention.<br>
+  From writing and debugging code to analyzing systems, managing files, running commands, and orchestrating tools, Agent-2 turns simple prompts into autonomous execution.
+  </em>
 </p>
 
 <p align="center">
@@ -20,6 +21,31 @@ github: github.com/aaravshah1311
   <img src="https://img.shields.io/badge/Status-Active-3ddc84?style=for-the-badge" />
 </p>
 
+<table align="center" width="100%">
+<tr><td>
+<p align="center">
+  <strong><i>Sponsored by</i></strong><br><br>
+  <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">
+    <picture>
+      <img src="pic/Fluxion_AI_English_Partner_Banner_v3.png" width="100%">
+    </picture>
+  </a>
+</p>
+
+
+<h3 align="center">
+  <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">Fluxion AI - Reliable, cost-efficient access to GPT, Claude, and other leading AI models</a>
+</h3>
+<p align="center">
+  <sub>
+    Fluxion AI provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing—and get $3 in API credits when you sign up through this link.</sub>
+    <br><br>
+  <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">Click Here</a> to Avail Free Credits
+</p>
+</td></tr>
+</table>
+
+<hr>
 <p align="center">
   <a href="#-what-it-is">What it is</a> •
   <a href="#-quick-start">Quick start</a> •
