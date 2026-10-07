@@ -390,6 +390,16 @@ def _build_static_prompt() -> str:
 - Build ENTIRE projects from a single prompt: create the full directory structure and EVERY file with `write_file`, install deps and run the project with `run_command`, then confirm it works.
 - If a command fails, read the error, fix the cause, and re-run — autonomously. Iterate until green.
 
+## VERIFY — never claim work you did not do
+- "Done" means done. After writing code, run the relevant command (build / test / lint /
+  scan) and READ its output before reporting success — do not report a task as verified when
+  you only assume the tool ran.
+- If a command failed, a test did not run, or a check was skipped, say so plainly and show
+  the real output. Never turn a failed run into a green report, and never quote a result you
+  did not observe.
+- When you need to be sure, verify with evidence: a real exit code, a real test result, a real
+  diff. One honest "I could not verify X" is worth more than two confident unverified claims.
+
 ## THE PROJECT DOC — `.agent2/agent2.md` is this project's own brief
 - If a `## PROJECT INSTRUCTIONS (.agent2/agent2.md)` section appears above, that IS this
   project: its purpose, features, architecture, commands and conventions. READ IT FIRST and
@@ -420,6 +430,8 @@ def _build_static_prompt() -> str:
 - `emit_plan` — show a plan for a complex task
 - `update_project_doc` — re-scan the project and refresh `.agent2/agent2.md` after you changed
   what it contains (see above)
+- Use tools efficiently: batch independent reads, prefer targeted `grep_search` / `read_file`
+  over dumping whole trees, and never re-run the same command for the same output in one turn.
 
 ## FILE INTELLIGENCE — understand & process any file
 Agent2 has a universal file-processing system. For ANY file the user references
@@ -449,7 +461,9 @@ Agent2 has a universal file-processing system. For ANY file the user references
 - Markdown: headers, **bold**, tables, code blocks
 - Concise but complete — no filler. Summarise what you built and how to run it.
 - "Concise" never means one word. A reply that is only "Done." or "ok" is a bug: say what
-  you did, what you verified, and what makes sense next."""
+  you did, what you verified, and what makes sense next.
+- Be honest about limitations: if you could not run or verify something, say so instead of
+  implying you did."""
 
 
 # ── System-prompt caches ───────────────────────────────────────────────────────
@@ -527,6 +541,37 @@ def _tool_args(meta: dict, content: str) -> dict:
     return {"command": meta.get("cmd", ""), "description": content}
 
 
+def _signature_to_text(sig) -> str:
+    """Encode a Gemini `thought_signature` for the JSON `meta` column.
+
+    ⚠️ GEMINI 3 (and thinking models) ATTACH A SIGNATURE TO EVERY `functionCall`
+    PART AND REQUIRE IT BACK when that call is replayed in history. Rebuilding the
+    call from the DB without it fails the whole NEXT request with
+    `Function call is missing a thought_signature in functionCall parts …` —
+    which reads like the model's fault and lands only after a tool has already
+    run. The signature is bytes and the column is JSON text, so it is base64ed
+    here and decoded by `_signature_from_text` on the way back into context.
+    """
+    if not sig:
+        return ""
+    if isinstance(sig, str):
+        sig = sig.encode("utf-8", "surrogatepass")
+    try:
+        return base64.b64encode(bytes(sig)).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _signature_from_text(text) -> bytes | None:
+    """Decode a stored `thought_signature`, or None when absent/unreadable."""
+    if not text:
+        return None
+    try:
+        return base64.b64decode(str(text))
+    except Exception:
+        return None
+
+
 def build_context(chat_id: str) -> list[types.Content]:
     """Fetch the last MAX_CTX_MESSAGES rows and convert to Gemini Content objects.
 
@@ -560,6 +605,12 @@ def build_context(chat_id: str) -> list[types.Content]:
     rows.reverse()
 
     ctx: list[types.Content] = []
+    #: Indices of `tool_call` rows whose function_call was NOT emitted, so the
+    #: matching `tool_result` must be dropped too. Without this, skipping a
+    #: leading call (see below) would leave its response as an orphan — the exact
+    #: "function response turn comes immediately after a function call turn" 400,
+    #: just moved one row down.
+    skipped_calls: set[int] = set()
     for i, r in enumerate(rows):
         role, content = r["role"], r["content"]
 
@@ -567,20 +618,57 @@ def build_context(chat_id: str) -> list[types.Content]:
             ctx.append(types.Content(role="user", parts=[types.Part(text=content)]))
 
         elif role == "assistant":
-            ctx.append(types.Content(role="model", parts=[types.Part(text=content)]))
+            # Thinking mode: the run_agent loop persists an assistant turn's
+            # `thought=True` parts under `meta["thought"]`, and Gemini wants them
+            # passed back with the NEXT turn's history — a model that spends its
+            # budget thinking across turns must see its own reasoning, exactly as
+            # the custom-provider loops replant thinking blocks. Rebuilt parts
+            # carry `thought=True` so the response parser can tell them apart.
+            meta = json.loads(r.get("meta") or "{}")
+            parts = [types.Part(text=content)]
+            thoughts = meta.get("thought") if isinstance(meta, dict) else None
+            if isinstance(thoughts, list):
+                restored = [types.Part(thought=True, text=str(t))
+                            for t in thoughts if t]
+                if restored:
+                    # Thoughts precede the visible text, as they did in-line.
+                    parts = restored + parts
+            ctx.append(types.Content(role="model", parts=parts))
 
         elif role == "tool_call":
             # Only emit the call if its result is the very next row. A
             # function_call with no matching function_response is rejected by
             # Gemini, so a dangling half would cost the turn, not the message.
-            if i + 1 < len(rows) and rows[i + 1]["role"] == "tool_result":
+            #
+            # ⚠️ AND the call must itself follow a USER or a function_response
+            # turn. The window is a `LIMIT` off the newest end, so its oldest row
+            # can be the model half of a tool round-trip — and a conversation that
+            # OPENS with a `function_call` fails the whole turn with "Please ensure
+            # that function call turn comes immediately after a user turn or after a
+            # function response turn." That was the most common 400 in the field
+            # database. Skipping it (and its result) trims the window to a valid
+            # opening instead of refusing the turn.
+            prev_role = rows[i - 1]["role"] if i > 0 else ""
+            has_result = i + 1 < len(rows) and rows[i + 1]["role"] == "tool_result"
+            if has_result and prev_role in ("user", "tool_result"):
                 meta = json.loads(r.get("meta") or "{}")
+                # ⚠️ The signature travels with the call or Gemini 3 refuses the
+                # request ("Function call is missing a thought_signature"). It was
+                # captured from the response part that produced this call and
+                # stored by `run_agent`; a row written before this feature exists
+                # simply has none, and older/NON-thinking models accept the call
+                # without one.
                 ctx.append(types.Content(
                     role="model",
-                    parts=[types.Part(function_call=types.FunctionCall(
-                        name=_tool_name(meta),
-                        args=_tool_args(meta, content)))],
+                    parts=[types.Part(
+                        function_call=types.FunctionCall(
+                            name=_tool_name(meta),
+                            args=_tool_args(meta, content)),
+                        thought_signature=_signature_from_text(
+                            meta.get("thought_signature")))],
                 ))
+            else:
+                skipped_calls.add(i)
 
         elif role == "tool_result":
             # The mirror of the rule above, and it is NOT redundant: the window
@@ -592,7 +680,8 @@ def build_context(chat_id: str) -> list[types.Content]:
             # tool-using conversation is an orphan and the whole turn dies at the
             # vendor. Skipping only the tool_call was self-consistent and half a
             # rule.
-            if i == 0 or rows[i - 1]["role"] != "tool_call":
+            if (i == 0 or rows[i - 1]["role"] != "tool_call"
+                    or (i - 1) in skipped_calls):
                 continue
             meta = json.loads(r.get("meta") or "{}")
             response = {"output": content[:MAX_TOOL_OUTPUT]}
@@ -1133,15 +1222,34 @@ def run_agent(
                     "type": "warning"}, room=sid)
                 continue
 
-            hint = (
-                f"\n\n> Model `{api_model}` may not be available on your key tier. "
-                "Try **2.5 Flash**."
-                if is_model_err else (
-                    "\n\n> This looks like a temporary network/server issue. "
-                    "It was retried automatically — please try again."
-                    if kind == "transient" else ""
-                )
-            )
+            # Kind-aware hint. The default model label is read from config rather
+            # than hard-coded, so adding/renaming models never leaves a stale
+            # suggestion pointing at a model that no longer exists.
+            _default_label = (MODELS.get(DEFAULT_MODEL) or {})\
+                .get("label", DEFAULT_MODEL)
+            if is_model_err:
+                hint = (f"\n\n> Model `{api_model}` may not be available on your "
+                        f"key tier. Try **{_default_label}**.")
+            elif kind == "transient":
+                hint = ("\n\n> This looks like a temporary network/server issue. "
+                        "It was retried automatically — please try again.")
+            elif kind == "context":
+                hint = ("\n\n> Your message is too large for this model's input "
+                        "window. Shorten it, or switch to a model with a bigger "
+                        "context window.")
+            elif kind == "safety":
+                hint = ("\n\n> This model's safety policy blocked the request. "
+                        "Rephrasing the content may help.")
+            elif kind == "quota":
+                hint = ("\n\n> Your API quota or rate limit is exhausted on this "
+                        "model. Rotating to another key or waiting a moment "
+                        "usually fixes it.")
+            elif kind == "schema":
+                hint = ("\n\n> The provider rejected one of Agent2's tool schemas "
+                        "before the message ran. This is a build-time defect, not "
+                        "your request — update Agent2.")
+            else:
+                hint = ""
             if len(tried_models) > 1:
                 hint += ("\n\n> Also tried: "
                          + ", ".join(f"`{m}`" for m in tried_models[1:]) + ".")
@@ -1177,6 +1285,16 @@ def run_agent(
                 _finish()
                 return
             parts = candidate.content.parts or []
+            # Thinking-mode turns return `thought=True` parts; their text is the
+            # model's reasoning, not its reply. Persisted on the final assistant
+            # row under `meta["thought"]` so `build_context` can hand it back to
+            # the model on the next turn — Gemini wants its own thinking.
+            try:
+                thoughts_to_save: list[str] = [
+                    p.text for p in parts
+                    if getattr(p, "thought", False) and getattr(p, "text", None)]
+            except Exception:
+                thoughts_to_save = []
         except (IndexError, AttributeError) as exc:
             msg = f"**Response parse error:** {exc}. Try again or switch models."
             save_msg(chat_id, "assistant", msg)
@@ -1196,6 +1314,11 @@ def run_agent(
         # `write_file`, which is a wrong answer with no error anywhere.
         # The extras are logged rather than dropped in silence.
         func_call: types.FunctionCall | None = None
+        #: Gemini 3 requires the signature that came with the call to be handed
+        #: back whenever the call is replayed, in this turn's appended history and
+        #: in the DB row `build_context` rebuilds it from. Captured from the SAME
+        #: part as the call, so the two can never be paired wrongly.
+        func_signature = None
         extra_calls = 0
         texts: list[str] = []
         for idx, p in enumerate(parts):
@@ -1203,6 +1326,7 @@ def run_agent(
                 if p.function_call and p.function_call.name:
                     if func_call is None:
                         func_call = p.function_call
+                        func_signature = getattr(p, "thought_signature", None)
                     else:
                         extra_calls += 1
                 elif p.text and not getattr(p, "thought", False):
@@ -1251,7 +1375,9 @@ def run_agent(
             cmd  = args.get("command", "")
             desc = args.get("description", "Running…")
 
-            save_msg(chat_id, "tool_call", desc, {"args": args, "cmd": cmd})
+            save_msg(chat_id, "tool_call", desc,
+                     {"args": args, "cmd": cmd,
+                      "thought_signature": _signature_to_text(func_signature)})
             socketio.emit("chat_tool_call",
                           {"command": cmd, "description": desc,
                            "shell": SHELL_LABEL, "tool": "run_command"},
@@ -1292,7 +1418,8 @@ def run_agent(
 
             context.append(types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(name="run_command", args=args))],
+                parts=[types.Part(function_call=types.FunctionCall(name="run_command", args=args),
+                                  thought_signature=func_signature)],
             ))
             context.append(types.Content(
                 role="user",
@@ -1320,7 +1447,9 @@ def run_agent(
             targs = dict(func_call.args)
             desc  = _tool_label(tname, targs)
 
-            save_msg(chat_id, "tool_call", desc, {"args": targs, "local": tname})
+            save_msg(chat_id, "tool_call", desc,
+                     {"args": targs, "local": tname,
+                      "thought_signature": _signature_to_text(func_signature)})
             socketio.emit("chat_tool_call",
                           {"command": f"{tname}(…)", "description": desc,
                            "shell": "tool", "tool": tname},
@@ -1367,7 +1496,8 @@ def run_agent(
 
             context.append(types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(name=tname, args=targs))],
+                parts=[types.Part(function_call=types.FunctionCall(name=tname, args=targs),
+                                  thought_signature=func_signature)],
             ))
             context.append(types.Content(
                 role="user",
@@ -1392,7 +1522,9 @@ def run_agent(
             bargs = dict(func_call.args)
             desc  = f"Burp: {bname}"
 
-            save_msg(chat_id, "tool_call", desc, {"args": bargs, "burp": bname})
+            save_msg(chat_id, "tool_call", desc,
+                     {"args": bargs, "burp": bname,
+                      "thought_signature": _signature_to_text(func_signature)})
             socketio.emit("chat_tool_call",
                           {"command": f"{bname}({', '.join(f'{k}={v}' for k, v in bargs.items())[:200]})",
                            "description": desc, "shell": "Burp MCP", "tool": bname},
@@ -1414,7 +1546,8 @@ def run_agent(
 
             context.append(types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(name=bname, args=bargs))],
+                parts=[types.Part(function_call=types.FunctionCall(name=bname, args=bargs),
+                                  thought_signature=func_signature)],
             ))
             context.append(types.Content(
                 role="user",
@@ -1444,7 +1577,8 @@ def run_agent(
             desc  = f"{label}: {mname}"
 
             save_msg(chat_id, "tool_call", desc,
-                     {"args": margs, "mcp": mname, "server": mcp_bridge.SERVER_KEY})
+                     {"args": margs, "mcp": mname, "server": mcp_bridge.SERVER_KEY,
+                      "thought_signature": _signature_to_text(func_signature)})
             socketio.emit("chat_tool_call",
                           {"command": f"{mname}({', '.join(f'{k}={v}' for k, v in margs.items())[:200]})",
                            "description": desc, "shell": f"{label} MCP", "tool": mname},
@@ -1467,7 +1601,8 @@ def run_agent(
 
             context.append(types.Content(
                 role="model",
-                parts=[types.Part(function_call=types.FunctionCall(name=mname, args=margs))],
+                parts=[types.Part(function_call=types.FunctionCall(name=mname, args=margs),
+                                  thought_signature=func_signature)],
             ))
             context.append(types.Content(
                 role="user",
@@ -1488,6 +1623,7 @@ def run_agent(
             # with tools OFF and no output cap: with nothing to call and room to
             # speak, the model answers the message instead of burning the budget
             # on thinking. Only if that also comes back empty do we say so.
+            thoughts_meta: list[str] | None = thoughts_to_save
             if is_blank_reply(final):
                 retry_text, fatal = _retry_without_tools(
                     client, api_model, context, cfg_kwargs, stop)
@@ -1520,8 +1656,13 @@ def run_agent(
                 else:
                     final = blank_reply_notice(
                         getattr(candidate, "finish_reason", None))
+                # The final text came from a re-ask (or a notice), not this
+                # candidate — persisting ITS thoughts to the next turn would
+                # replay reasoning that led to nothing the user saw.
+                thoughts_meta = None
 
-            save_msg(chat_id, "assistant", final)
+            save_msg(chat_id, "assistant", final,
+                     {"thought": thoughts_to_save[:8]} if thoughts_meta else None)
             socketio.emit("chat_response", {"text": final, "done": True, "tokens": total_tokens}, room=sid)
             # Items 8 + 10: close the trail, then report what the turn actually
             # did. `file_summary` self-gates on files > 0, so a plain question

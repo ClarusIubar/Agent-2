@@ -456,6 +456,71 @@ def test_build_context_skips_orphan_tool_call(chat):
     assert [c.role for c in ctx] == ["user"]
 
 
+def test_build_context_restores_a_thought_signature(chat):
+    """⚠️ Gemini 3 requires the call's `thought_signature` back on replay.
+
+    `run_agent` persists the signature from the response part that produced the
+    call; build_context must put it back on the rebuilt function_call or the
+    NEXT turn fails with "Function call is missing a thought_signature".
+    """
+    sig = b"\x01\x02\xfe\xff"
+    A.save_msg(chat, "user", "read me a file")
+    A.save_msg(chat, "tool_call", "Reading: x.py",
+               {"local": "read_file", "args": {"path": "x.py"},
+                "thought_signature": A._signature_to_text(sig)})
+    A.save_msg(chat, "tool_result", "contents", {"ok": True, "local": "read_file"})
+
+    ctx = A.build_context(chat)
+    assert ctx[1].parts[0].function_call.name == "read_file"
+    assert ctx[1].parts[0].thought_signature == sig
+
+
+def test_build_context_tolerates_a_missing_or_bad_signature(chat):
+    """Rows written before the feature, or with a corrupt value, still build."""
+    A.save_msg(chat, "user", "hello")
+    A.save_msg(chat, "tool_call", "Reading: x.py",
+               {"local": "read_file", "args": {"path": "x.py"}})
+    A.save_msg(chat, "tool_result", "contents", {"ok": True, "local": "read_file"})
+    A.save_msg(chat, "tool_call", "Reading: y.py",
+               {"local": "read_file", "args": {"path": "y.py"},
+                "thought_signature": "not base64!!"})
+    A.save_msg(chat, "tool_result", "more", {"ok": True, "local": "read_file"})
+
+    ctx = A.build_context(chat)
+    calls = [p for c in ctx for p in c.parts if p.function_call]
+    assert [p.thought_signature for p in calls] == [None, None]
+
+
+def test_signature_round_trips_through_text():
+    for raw in (b"", b"\x00\xff\x10", "unicode-\u00e9"):
+        if raw == b"":
+            assert A._signature_to_text(raw) == ""
+            assert A._signature_from_text("") is None
+            continue
+        expected = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+        encoded = A._signature_to_text(raw)
+        assert A._signature_from_text(encoded) == expected
+
+
+def test_build_context_never_opens_with_a_function_call(chat):
+    """The window can start on the model half of a tool round-trip.
+
+    Gemini rejects a conversation that opens with a function_call ("Please ensure
+    that function call turn comes immediately after a user turn or after a
+    function response turn") — the commonest 400 in the field database. The call
+    and its response are both dropped, trimming the window to a valid opening.
+    """
+    A.save_msg(chat, "tool_call", "Listing",
+               {"local": "list_dir", "args": {"path": "."}})
+    A.save_msg(chat, "tool_result", "3 entries", {"local": "list_dir", "ok": True})
+    A.save_msg(chat, "user", "hi")
+
+    ctx = A.build_context(chat)
+    assert [c.role for c in ctx] == ["user"]
+    assert not any(p.function_call for c in ctx for p in c.parts)
+    assert not any(p.function_response for c in ctx for p in c.parts)
+
+
 def test_build_context_skips_orphan_tool_result(chat):
     """The exact mirror of the test above, and it is NOT redundant.
 
@@ -503,21 +568,37 @@ def test_build_context_never_opens_with_an_orphan_function_response(chat):
     assert ctx[0].parts[0].text == "a0"
 
 
-def test_build_context_keeps_a_pair_whose_call_is_the_oldest_row(chat):
-    """The tool_result guard may not be over-eager.
+def test_build_context_drops_a_pair_whose_call_is_the_oldest_row(chat):
+    """A window that OPENS on a function_call is refused by Gemini 3.
 
-    A tool_call at index 0 whose result sits at index 1 is a COMPLETE pair, and
-    dropping it would silently shrink every conversation whose window happens to
-    start on a tool call — the opposite failure, equally invisible.
+    "Please ensure that function call turn comes immediately after a user turn or
+    after a function response turn." The window is a LIMIT off the newest end, so
+    its oldest row can be the model half of a tool round-trip; that half and its
+    response are dropped so the window has a legal opening.
+
+    This supersedes the earlier contract, which kept a call at index 0 because the
+    pair was complete. It is complete, and still illegal: the field database shows
+    the 400 fired repeatedly until the leading call was trimmed.
     """
     A.save_msg(chat, "tool_call", "Reading: x.py",
                {"local": "read_file", "args": {"path": "x.py"}})
     A.save_msg(chat, "tool_result", "contents", {"ok": True, "local": "read_file"})
 
     ctx = A.build_context(chat)
-    assert [c.role for c in ctx] == ["model", "user"]
-    assert ctx[0].parts[0].function_call.name == "read_file"
-    assert ctx[1].parts[0].function_response.name == "read_file"
+    assert ctx == [], "a leading function_call pair must be trimmed"
+
+
+def test_build_context_keeps_a_leading_pair_when_a_user_turn_precedes_it(chat):
+    """The trim is only for a CALL at the very front — a user turn validates it."""
+    A.save_msg(chat, "user", "read it")
+    A.save_msg(chat, "tool_call", "Reading: x.py",
+               {"local": "read_file", "args": {"path": "x.py"}})
+    A.save_msg(chat, "tool_result", "contents", {"ok": True, "local": "read_file"})
+
+    ctx = A.build_context(chat)
+    assert [c.role for c in ctx] == ["user", "model", "user"]
+    assert ctx[1].parts[0].function_call.name == "read_file"
+    assert ctx[2].parts[0].function_response.name == "read_file"
 
 
 def test_build_context_caps_at_max_messages(chat):
@@ -585,6 +666,7 @@ def test_build_context_names_the_call_and_result_identically(chat):
     is resolved from `meta` in ONE place for both row kinds. This is the test
     that would catch the two resolutions drifting apart.
     """
+    A.save_msg(chat, "user", "go")
     for meta in ({"local": "read_file"}, {"burp": "burp_repeater"}, {}):
         A.save_msg(chat, "tool_call", "call", {**meta, "args": {}})
         A.save_msg(chat, "tool_result", "result", meta)
@@ -603,10 +685,11 @@ def test_build_context_does_not_invent_args_for_a_named_tool(chat):
     rebuilt from legacy meta. Handing that to `read_file` would pass parameters
     its schema does not declare.
     """
+    A.save_msg(chat, "user", "read it")
     A.save_msg(chat, "tool_call", "some description", {"local": "read_file"})
     A.save_msg(chat, "tool_result", "ok", {"local": "read_file", "ok": True})
 
-    fc = A.build_context(chat)[0].parts[0].function_call
+    fc = A.build_context(chat)[1].parts[0].function_call
     assert fc.name == "read_file"
     assert fc.args == {}, f"invented args for a named tool: {fc.args}"
 
@@ -617,13 +700,14 @@ def test_build_context_reports_returncode_only_for_shell(chat):
     Leaking it would tell the model a `read_file` call "exited 0", which is a
     fact about a process that never existed.
     """
+    A.save_msg(chat, "user", "do it")
     A.save_msg(chat, "tool_call", "read", {"local": "read_file", "args": {}})
     A.save_msg(chat, "tool_result", "body", {"local": "read_file", "ok": False})
     A.save_msg(chat, "tool_call", "shell", {"args": {"command": "ls"}})
     A.save_msg(chat, "tool_result", "listing", {"rc": 2})
 
     ctx = A.build_context(chat)
-    local, shell = ctx[1].parts[0].function_response, ctx[3].parts[0].function_response
+    local, shell = ctx[2].parts[0].function_response, ctx[4].parts[0].function_response
     assert "returncode" not in local.response
     assert local.response["success"] is False       # from `ok`, not from `rc`
     assert shell.response["returncode"] == 2

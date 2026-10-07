@@ -42,7 +42,10 @@ import random
 import threading
 import time
 
-from agent2.config import SHELL_LABEL, MAX_AGENT_ITERS, MAX_TOOL_OUTPUT, MAX_RETRIES
+from agent2.config import (
+    SHELL_LABEL, MAX_AGENT_ITERS, MAX_TOOL_OUTPUT, MAX_RETRIES,
+    MODES, DEFAULT_MODE,
+)
 from agent2.database import qall, qone, exe
 from agent2.llm import providers
 from agent2.llm import router
@@ -68,7 +71,8 @@ from agent2.agent import (
 SHELL_TOOL = "run_command"
 
 
-def _retry_text_only(prov: dict, messages: list[dict], system: str, stop) -> str:
+def _retry_text_only(prov: dict, messages: list[dict], system: str, stop,
+                     max_tokens: int | None = None) -> str:
     """Re-ask a custom provider for plain text after a blank/filler reply.
 
     Mirrors agent.py's `_retry_without_tools`: dropping the tool schemas removes
@@ -79,7 +83,8 @@ def _retry_text_only(prov: dict, messages: list[dict], system: str, stop) -> str
         return ""
     try:
         result = call_with_retry(
-            lambda: providers.chat(prov, messages, system, use_tools=False),
+            lambda: providers.chat(prov, messages, system, use_tools=False,
+                                   max_tokens=max_tokens),
             should_stop=stop.is_set,
         )
     except Exception:
@@ -229,8 +234,13 @@ def _exec_tool(name: str, args: dict, sid: str, term_id: str, socketio,
 
 
 def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
-                       attachments=None) -> None:
-    """Main loop for a custom provider. `pid` is the provider id (after 'custom:')."""
+                       attachments=None, mode=None) -> None:
+    """Main loop for a custom provider. `pid` is the provider id (after 'custom:').
+
+    `mode` is the optional MODES key (e.g. "thinking"), forwarded from the
+    dispatch surface to size the output ceiling; None falls back to the default
+    mode, so calls that predate the parameter keep working.
+    """
     ws = _workspace.current()
     session = sessions.open(sid, chat_id, workspace_id=ws.id)
     stop = session.cancel
@@ -321,15 +331,19 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
             socketio.emit("toast",
                           {"msg": _msg, "type": "success" if _ok else "warning"}, room=sid)
 
-    # Build message history from DB (plain user/assistant text is enough to seed;
-    # tool round-trips within THIS turn are kept in the provider-native format).
+    # Build message history from DB. ⚠️ THESE ROWS ARE NOT A TEXT-ONLY SEED:
+    # reasoning/thinking models reject a history that lost their previous reply's
+    # thinking, so `providers.history_messages` restores the opaque native
+    # assistant payloads we saved under `meta.provider_state`. Tool round-trips
+    # within a PREVIOUS turn are still omitted (as they always were) — the
+    # persisted final assistant block is what those models require. Tool
+    # round-trips within THIS turn are kept in the provider-native format below.
     history = qall(
-        "SELECT role, content FROM messages WHERE chat_id=? "
+        "SELECT role, content, meta FROM messages WHERE chat_id=? "
         f"AND role IN ('user','assistant') {MSG_ORDER_DESC} LIMIT 20",
         (chat_id,))
     history.reverse()
-    messages: list[dict] = [{"role": h["role"] if h["role"] == "user" else "assistant",
-                             "content": h["content"]} for h in history]
+    messages: list[dict] = providers.history_messages(history, fmt)
 
     # Feed the PIL-processed copy to the model (history keeps the original). The
     # last row is the current user turn we just saved.
@@ -364,7 +378,18 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
                            mcp_blocks=[b.prompt_block() for b in _mcp_bridges],
                            context=_bundle)
 
+    # Output ceiling for the mode the user picked on this turn. `MODES` prefers
+    # an unknown key to the default mode rather than failing, so a stale mode
+    # never becomes a mid-turn 400.
+    _mode_cfg = MODES.get(str(mode or "")) or MODES.get(DEFAULT_MODE) \
+        or MODES.get("pro") or {}
+    _output_max = int(_mode_cfg.get("max_tokens") or 0) or None
+
     total_tokens = 0
+    # One reconstruction retry per turn: a `state_missing` reply means the
+    # history lost the model's own thinking, and the ONLY fix is to strip the
+    # stale blocks and ask once more. Never a blind retry, never a model switch.
+    _state_rebuilt = False
     for _ in range(MAX_AGENT_ITERS):
         if stop.is_set():
             _stopped(total_tokens)
@@ -379,8 +404,17 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
                     room=sid,
                 )
             _started = time.time()
+            # Drop anything the current feed cannot pair — a resumed turn or a
+            # partial batch must never hand the provider an orphaned tool_result
+            # or a dangling tool_use.
+            messages = providers.repair_feed(messages, fmt)
             result = call_with_retry(
-                lambda: providers.chat(prov, messages, system),
+                # `refs=…`: `messages` is REBOUND by the state_missing branch
+                # below, so bind the current list at construction time — a
+                # late-bound read would let an in-flight retry send the history
+                # the CURRENT iteration was built from.
+                lambda refs=messages: providers.chat(prov, refs, system,
+                                                     max_tokens=_output_max),
                 on_retry=_on_retry,
                 should_stop=stop.is_set,
             )
@@ -394,18 +428,54 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
             # So the ledger and the breaker apply (they are what `/api/models` and
             # the health surface read), and the model choice does not.
             _model_key = "custom:" + str(prov.get("id") or "")
+            _kind = classify_error(exc)
             router.record_attempt(
                 model=_model_key, ok=False,
                 latency_ms=int((time.time() - _started) * 1000),
-                primary_model=_model_key, failure_kind=classify_error(exc) or "unknown",
+                primary_model=_model_key, failure_kind=_kind or "unknown",
                 failure_reason=str(exc), chat_id=chat_id, session_id=sid)
-            router.note_failure(_model_key, classify_error(exc))
+            router.note_failure(_model_key, _kind)
             if stop.is_set():
                 _stopped(total_tokens)
                 return
-            extra = ("\n\n> Temporary network/server issue — retried automatically. Please try again."
-                     if classify_error(exc) == "transient" else "")
-            msg = f"**Provider error ({prov.get('model_id')}):** {exc}{extra}"
+            # ⚠️ state_missing is the ONE deterministic failure this loop can
+            # fix in place: the request lacked the previous assistant turn's
+            # thinking/reasoning, and the provider told us so. Strip the stale
+            # state and re-ask ONCE — repeating the identical history would fail
+            # identically, and falling back to another provider would replay (or
+            # drop) state that belongs to this wire format either way.
+            if _kind == "state_missing" and not _state_rebuilt:
+                _state_rebuilt = True
+                messages = providers.strip_native_state(messages, fmt)
+                continue
+            # Kind-aware hint, so the class of failure tells the user what the
+            # fix is instead of burying it in a generic message.
+            if _kind == "transient":
+                extra = ("\n\n> Temporary network/server issue — retried "
+                         "automatically. Please try again.")
+            elif _kind == "context":
+                extra = ("\n\n> Your message is too large for this model's input "
+                         "window. Shorten the request or switch to a model with "
+                         "a bigger context window.")
+            elif _kind == "safety":
+                extra = ("\n\n> The provider's safety policy blocked the request. "
+                         "The content may need to be rephrased.")
+            elif _kind == "quota":
+                extra = ("\n\n> The provider's rate limit or quota is exhausted. "
+                         "A different custom provider, or a retry after a pause, "
+                         "will work.")
+            elif _kind == "schema":
+                extra = ("\n\n> The provider rejected one of Agent2's tool schemas "
+                         "before the message ran. This is a build-time defect, not "
+                         "your request — update Agent2, or disconnect an MCP bridge "
+                         "that may be supplying the malformed tool.")
+            else:
+                extra = ""
+            # Prefer the envelope's own `message` when the body parsed as an
+            # error envelope — "thinking … must be passed back" reads better than
+            # the JSON around it. Identical to `str(exc)` when nothing parsed.
+            _show = providers.normalize_provider_error(exc)["message"] or str(exc)
+            msg = f"**Provider error ({prov.get('model_id')}):** {_show}{extra}"
             save_msg(chat_id, "assistant", msg)
             socketio.emit("chat_response", {"text": msg, "done": True, "tokens": total_tokens}, room=sid)
             _finish()
@@ -416,6 +486,12 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
                               latency_ms=int((time.time() - _started) * 1000),
                               primary_model=_pid_key, chat_id=chat_id, session_id=sid)
         router.note_success(_pid_key)
+
+        # A call the model emitted as TEXT (DeepSeek's "|DSML| invoke ...", the
+        # Claude-Code "<invoke ...>" shape) is recovered into a real call here and
+        # RUN below, instead of dead-ending as a blank/filler reply. A no-op when
+        # the provider returned a structured call, which is the common case.
+        result = providers.adopt_textual_tool_calls(result)
 
         total_tokens += result.get("tokens", 0) or 0
         _metrics.tokens(_pid_key, result.get("tokens", 0) or 0)
@@ -428,11 +504,34 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
             # Same blank-reply guard as the Gemini loop: retry once with no tool
             # schemas attached before falling back to an honest notice, so a
             # simple "hi" can never come back as a bare "Done.".
-            if is_blank_reply(final):
-                final = _retry_text_only(prov, messages, system, stop) \
-                    or blank_reply_notice()
+            #
+            # A tool call emitted as TEXT (Claude-Code `<invoke name=…>` markup
+            # or the mangled ｜｜ paste artifact) is the same failure class:
+            # persisted verbatim it poisons history and the next turns spiral.
+            _state = providers.assistant_state(result)
+            _structural = providers.is_tool_call_text(final)
+            if is_blank_reply(final) or _structural:
+                _retried = _retry_text_only(prov, messages, system, stop,
+                                            max_tokens=_output_max)
+                if _structural:
+                    final = (_retried if (_retried
+                                          and not providers.is_tool_call_text(_retried))
+                             else "The model returned its tool call as text instead of "
+                                  "calling it. Please try again — nothing ran.")
+                elif _retried:
+                    final = _retried
+                else:
+                    final = blank_reply_notice()
+                # The text above came from a RE-ASK whose native payload we do
+                # not hold — persist no state, or the next turn replants thinking
+                # that belongs to a reply it never stored.
+                _state = None
 
-            save_msg(chat_id, "assistant", final)
+            # Persist the native assistant payload (thinking/reasoning blocks)
+            # so the NEXT turn can restore them via `providers.history_messages`.
+            # Opaque to this loop: the adapter owns the shape.
+            save_msg(chat_id, "assistant", final,
+                     {providers.PROVIDER_STATE_KEY: _state} if _state else None)
             socketio.emit("chat_response", {"text": final, "done": True, "tokens": total_tokens}, room=sid)
             # Items 8 + 10, same as the Gemini loop: close the trail, then report
             # what the turn did. `file_summary` self-gates on files > 0.
@@ -446,7 +545,14 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
         # iteration — see the module docstring for why abandoning a half-answered
         # batch is safe on the wire.
         if fmt == "anthropic":
-            messages.append({"role": "assistant", "content": result.get("raw_content", [])})
+            # Rebuild from the adapter: some Anthropic-compat emulators return
+            # text AFTER tool_use (or drop tool_use from raw_content), and the
+            # server then rejects our next tool_result as orphaned. The adapter
+            # reorders/synthesises so every tool_result's id is matched two
+            # messages down, and strips null inputs that emulators reject even
+            # though the schema allows the absent key.
+            messages.append({"role": "assistant",
+                             "content": providers.anthropic_assistant_content(result)})
             tool_results = []
             for tc in tool_calls:
                 if stop.is_set():
@@ -461,13 +567,34 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
                                      "content": out or "(no output)"})
             messages.append({"role": "user", "content": tool_results})
         else:  # openai
-            messages.append(result.get("raw_assistant") or
-                            {"role": "assistant", "content": result.get("text", ""),
-                             "tool_calls": [
-                                 {"id": tc["id"], "type": "function",
-                                  "function": {"name": tc["name"],
-                                               "arguments": json.dumps(tc["args"])}}
-                                 for tc in tool_calls]})
+            raw_assistant = result.get("raw_assistant")
+            if isinstance(raw_assistant, dict):
+                rebuilt = {"role": "assistant",
+                           "content": raw_assistant.get("content") or result.get("text", "")}
+                call_rows = []
+                for tc_row in (raw_assistant.get("tool_calls") or []):
+                    if not isinstance(tc_row, dict):
+                        continue
+                    fn = tc_row.get("function")
+                    if isinstance(fn, dict):
+                        try:
+                            args = json.loads(fn.get("arguments") or "{}")
+                        except Exception:
+                            args = {}
+                        fn = {**fn, "arguments": json.dumps(providers.strip_null_args(args))}
+                        tc_row = {**tc_row, "function": fn}
+                    call_rows.append(tc_row)
+                if call_rows:
+                    rebuilt["tool_calls"] = call_rows
+                messages.append(rebuilt)
+            else:
+                messages.append(
+                    {"role": "assistant", "content": result.get("text", ""),
+                     "tool_calls": [
+                         {"id": tc["id"], "type": "function",
+                          "function": {"name": tc["name"],
+                                       "arguments": json.dumps(tc["args"])}}
+                         for tc in tool_calls]})
             for tc in tool_calls:
                 if stop.is_set():
                     _stopped(total_tokens)

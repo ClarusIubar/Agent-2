@@ -484,6 +484,22 @@ def note_failure(model_key: str, kind: str = "") -> bool:
     credential fails every model identically, so letting it cool them one by one
     would take the whole app offline over a problem in one API key — and the key
     rotator is the thing that actually fixes it.
+
+    ⚠️ `context` and `safety` have the same property for the same reason. A prompt
+    past the input window (or a message the provider's policy blocked) is
+    deterministic: the identical request fails on whichever model it is sent to,
+    and repeating it cannot wear a model out — cooling it would make the app look
+    down for content it simply refuses. Those kinds never trip the breaker either.
+
+    ⚠️ `state_missing` is the same shape from the other side: the request carried
+    no thinking/reasoning state the provider needs, and the identical request
+    fails wherever it goes — the loops strip and re-send once, and cooling a model
+    over it would hide the one fix that works.
+
+    ⚠️ `schema` joins them because the rejected schema is OUR declaration, sent
+    unchanged on every turn to every model. Cooling a model for it would take the
+    whole app offline over a build-time defect while changing nothing about the
+    request that fails.
     """
     key = str(model_key or "")
     if not key:
@@ -494,7 +510,7 @@ def note_failure(model_key: str, kind: str = "") -> bool:
         hits = [t for t in _failures.get(key, []) if now - t <= window]
         hits.append(now)
         _failures[key] = hits
-        if kind == "auth":
+        if kind in ("auth", "context", "safety", "state_missing", "schema"):
             return False
         if len(hits) >= int(_cfg.BREAKER_FAILS):
             _cooling_until[key] = now + float(_cfg.BREAKER_COOLDOWN)

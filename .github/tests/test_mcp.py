@@ -665,6 +665,8 @@ def test_build_context_grades_an_mcp_result_by_its_rc():
     exe("INSERT INTO chats(id, title) VALUES(?, 'mcp')", (cid,))
     try:
         exe("INSERT INTO messages(chat_id, role, content, meta) VALUES(?,?,?,?)",
+            (cid, "user", "check zap alerts", json.dumps({})))
+        exe("INSERT INTO messages(chat_id, role, content, meta) VALUES(?,?,?,?)",
             (cid, "tool_call", "OWASP ZAP: zap_alerts",
              json.dumps({"args": {}, "mcp": "zap_alerts", "server": "zap"})))
         exe("INSERT INTO messages(chat_id, role, content, meta) VALUES(?,?,?,?)",
@@ -691,6 +693,8 @@ def test_build_context_marks_a_failed_mcp_result_unsuccessful():
     cid = str(uuid.uuid4())
     exe("INSERT INTO chats(id, title) VALUES(?, 'mcp')", (cid,))
     try:
+        exe("INSERT INTO messages(chat_id, role, content, meta) VALUES(?,?,?,?)",
+            (cid, "user", "check zap alerts", json.dumps({})))
         exe("INSERT INTO messages(chat_id, role, content, meta) VALUES(?,?,?,?)",
             (cid, "tool_call", "OWASP ZAP: zap_alerts",
              json.dumps({"args": {}, "mcp": "zap_alerts"})))

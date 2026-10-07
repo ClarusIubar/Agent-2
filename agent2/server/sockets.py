@@ -130,7 +130,8 @@ def _dispatch_agent(chat_id, message, sid, term_id, model_key, mode_key,
     try:
         if isinstance(model_key, str) and model_key.startswith("custom:"):
             pid = model_key.split(":", 1)[1]
-            run_provider_agent(chat_id, message, sid, term_id, pid, socketio, attachments)
+            run_provider_agent(chat_id, message, sid, term_id, pid, socketio,
+                               attachments, mode=mode_key)
         else:
             run_agent(chat_id, message, sid, term_id, model_key, mode_key, socketio, attachments)
     except Exception as exc:

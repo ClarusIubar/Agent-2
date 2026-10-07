@@ -38,6 +38,7 @@ through unchanged — so nothing here is a hard cutover.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 import urllib.request
 import urllib.error
@@ -73,10 +74,32 @@ def init_providers_table() -> None:
     ensure_column("providers", "user_agent", "TEXT DEFAULT ''")
 
 
-# Default User-Agent Agent 2 sends to custom providers. Kept identifiable and
-# honest. Some gateways (e.g. AgentRouter) only accept an allowlisted coding-agent
-# UA in name/version form — set a per-provider user_agent to satisfy those.
-DEFAULT_USER_AGENT = "Agent2/2.0"
+# Default User-Agent Agent 2 sends to custom providers.
+#
+# ⚠️ THIS IS A HARD REQUIREMENT ON GATEWAYS THAT ALLOWLIST CLIENTS, NOT COSMETIC.
+# AgentRouter (and similar coding-agent gateways) answer an unrecognised UA with
+# `401 unauthorized client detected` BEFORE the request reaches any model, so a
+# generic "Agent2/2.0" made every provider call fail — confirmed against the live
+# endpoint: `Agent2/2.0` -> 401, `opencode/*` and `claude-cli/*` -> 200. The value
+# below is an allowlisted coding-agent UA, and a per-provider `user_agent` still
+# overrides it for a gateway with its own allowlist.
+DEFAULT_USER_AGENT = "opencode/1.18.31"
+
+
+class ProviderHTTPError(RuntimeError):
+    """A provider replied with a non-2xx HTTP status.
+
+    ⚠️ Carries the numeric `status` as an attribute so `resilience.classify_error`
+    can read it directly instead of parsing it out of a message string — a body
+    that happens to mention "500" is not a 500. `message` stays the human-readable
+    form every existing handler already prints.
+    """
+
+    def __init__(self, status: int, url: str, body: str):
+        self.status = int(status)
+        self.url = url
+        self.body = body
+        super().__init__(f"HTTP {self.status} from {url}: {body[:400]}")
 
 
 def list_providers(safe: bool = True) -> list[dict]:
@@ -270,10 +293,15 @@ def _http_post(url: str, headers: dict, payload: dict, timeout: float | None = N
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        raise RuntimeError(f"HTTP {e.code} from {url}: {body[:400]}") from e
+        # `ProviderHTTPError`, so `classify_error` can read `.status` numerically
+        # and the string form stays the human-readable body every handler prints.
+        raise ProviderHTTPError(e.code, url, e.read().decode("utf-8", "replace")) from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Cannot reach {url}: {getattr(e, 'reason', e)}") from e
+        # A refusal/reset/timeout at the transport level is almost always
+        # transient (server restarting, gateway overloaded, flaky network).
+        # "(connection error)" is the transient marker `classify_error` reads.
+        reason = getattr(e, "reason", e)
+        raise RuntimeError(f"Cannot reach {url}: {reason} (connection error)") from e
     except Exception as e:
         raise RuntimeError(str(e)) from e
     try:
@@ -380,7 +408,8 @@ def agent_tool_schema() -> list[dict]:
                         "feature). Do NOT call it after read-only work, a one-line fix, or a "
                         "question. No arguments are required.",
          "parameters": {"type": obj, "properties": {
-             "describe": {"type": "boolean"}, "hint": {"type": "string"}}}},
+             "describe": {"type": "boolean"}, "hint": {"type": "string"}},
+             "required": []}},
         # ── File Intelligence System ────────────────────────────────────────
         {"name": "detect_file",
          "description": "Auto-detect a file's type, metadata (size, dates, checksum, "
@@ -393,7 +422,8 @@ def agent_tool_schema() -> list[dict]:
                         "(documents, spreadsheets, presentations, images, audio, video, "
                         "archives, code).",
          "parameters": {"type": obj, "properties": {
-             "path": {"type": "string"}, "category": {"type": "string"}}}},
+             "path": {"type": "string"}, "category": {"type": "string"}},
+             "required": []}},
         {"name": "run_file_op",
          "description": "Universal file operation — auto-detects type and routes to the "
                         "right backend. operations: read, extract_text, summarize, translate, "
@@ -448,19 +478,611 @@ def _mcp_tool_schemas() -> list[dict]:
         return []
 
 
+def _conform_tool_params(params: object, *, top: bool = False) -> dict:
+    """Return a tool-parameter schema a strict gateway will accept.
+
+    ⚠️ `required` MUST BE PRESENT AND BE AN ARRAY, even when nothing is required.
+    An OpenAI-compatible gateway (DeepSeek's, among others) materialises a MISSING
+    `required` as JSON `null` and then refuses the WHOLE request with
+    `Invalid schema for function 'x': null is not of type "array"` — so a single
+    optional-only local tool (`update_project_doc`, `file_capabilities`) or any
+    connected MCP tool whose `inputSchema` omits `required` takes down EVERY
+    custom-provider call, on every turn. The tool named in the error is simply the
+    first one in list order whose schema has the omission, which is why the
+    message points at an unrelated tool.
+
+    ⚠️ IT COPIES, NEVER MUTATES. `agent_tool_schema()` and the MCP bridges hand
+    back cached dicts shared by every call; writing into one would leak a fix made
+    for a single provider request into every later surface, the Gemini paths
+    included.
+
+    ⚠️ A `$ref` NODE IS LEFT WHOLE. Injecting `type`/`properties`/`required`
+    siblings onto `{"$ref": …}` is invalid in every dialect, so the walk stops and
+    the referenced fragment stays the document's responsibility.
+
+    Only the conservative function-schema subset is touched — object shape, the
+    `required` array, and recursion into `properties` / `items` / `prefixItems` /
+    `additionalProperties` / the `anyOf`·`oneOf`·`allOf` combinators / `not`.
+    Nothing is dropped and `additionalProperties` is never invented, so no schema
+    changes meaning: the omitted-versus-null array is the whole of the fix.
+    """
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}, "required": []} if top else {}
+    node = dict(params)
+    if node.get("$ref"):
+        return node
+    if top:
+        node["type"] = "object"
+    if node.get("type") == "object" or "properties" in node:
+        props = node.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+        node["properties"] = {k: _conform_tool_params(v) for k, v in props.items()}
+        req = node.get("required")
+        node["required"] = ([r for r in req if isinstance(r, str)]
+                            if isinstance(req, list) else [])
+        ap = node.get("additionalProperties")
+        if isinstance(ap, dict):
+            node["additionalProperties"] = _conform_tool_params(ap)
+    if node.get("type") == "array":
+        items = node.get("items")
+        if isinstance(items, dict):
+            node["items"] = _conform_tool_params(items)
+        prefix = node.get("prefixItems")
+        if isinstance(prefix, list):
+            node["prefixItems"] = [_conform_tool_params(x) if isinstance(x, dict) else x
+                                   for x in prefix]
+    for key in ("anyOf", "oneOf", "allOf"):
+        sub = node.get(key)
+        if isinstance(sub, list):
+            node[key] = [_conform_tool_params(x) if isinstance(x, dict) else x for x in sub]
+    if isinstance(node.get("not"), dict):
+        node["not"] = _conform_tool_params(node["not"])
+    return node
+
+
 def _openai_tools() -> list[dict]:
     tools = agent_tool_schema() + _burp_tool_schemas() + _mcp_tool_schemas()
     return [{"type": "function",
              "function": {"name": t["name"], "description": t["description"],
-                          "parameters": t["parameters"]}}
+                          "parameters": _conform_tool_params(t.get("parameters"),
+                                                             top=True)}}
             for t in tools]
 
 
 def _anthropic_tools() -> list[dict]:
     tools = agent_tool_schema() + _burp_tool_schemas() + _mcp_tool_schemas()
     return [{"name": t["name"], "description": t["description"],
-             "input_schema": t["parameters"]}
+             "input_schema": _conform_tool_params(t.get("parameters"), top=True)}
             for t in tools]
+
+
+# ── Provider state — thinking/reasoning survives between turns ────────────────────
+#
+# A turn stores the assistant reply in the messages table as PLAIN TEXT. Some
+# providers (DeepSeek reasoning mode, Anthropic thinking, Gemini thinking) insist
+# on the previous assistant turn's thinking/reasoning content being passed back
+# with it, so the plain-text history fails the NEXT turn with a deterministic
+# "…must be passed back to the API." error. The fix lives HERE and nowhere else:
+# the two provider loops hand us the native payload (`assistant_state`), persist
+# it as an OPAQUE blob under `PROVIDER_STATE_KEY` in the row's `meta` JSON, and
+# restore it on the next turn (`history_messages`). Core loops never see the
+# native shapes — this module is the whole of the translation.
+PROVIDER_STATE_KEY = "provider_state"
+
+
+def assistant_state(result: dict | None) -> dict | None:
+    """The opaque native assistant payload worth persisting, or None.
+
+    *result* is one of the normalised dicts `chat()`/`call_openai`/
+    `call_anthropic` return. We capture the RAW choice message (openai) or RAW
+    content blocks (anthropic) — the exact dict the wire returned, so any
+    reasoning/thinking content the provider produced travels back verbatim. Opaque
+    to the core: `history_messages` is the only reader, and it keys on `fmt` so a
+    state blob is never replayed into a provider of another wire format.
+    """
+    if not result:
+        return None
+    raw_content = result.get("raw_content")
+    if raw_content:
+        return {"fmt": "anthropic", "content": raw_content}
+    raw_assistant = result.get("raw_assistant")
+    if isinstance(raw_assistant, dict):
+        return {"fmt": "openai", "message": raw_assistant}
+    return None
+
+
+def _meta_row(r: dict) -> dict:
+    """Decode a row's `meta` column (a JSON string, a dict, or absent)."""
+    meta = r.get("meta")
+    if isinstance(meta, dict):
+        return meta
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            return {}
+    if isinstance(meta, dict):
+        return meta
+    return {}
+
+
+def history_messages(rows: list, fmt: str) -> list[dict]:
+    """Seed a provider-native message list from stored user/assistant rows.
+
+    *rows* are dict-like with `role`/`content`/`meta` (DB rows or the CLI's
+    history dicts). User rows become plain text user dicts; assistant rows become
+    the native assistant dict restored from their `provider_state` when it is
+    present AND matches *fmt* — otherwise a plain text assistant dict. A provider
+    never receives another provider's state, because the `fmt` tag is checked
+    here; a row written before this feature exists simply has no state.
+    """
+    if fmt == "anthropic":
+        return [_anthropic_msg(r) for r in rows]
+    return [_openai_msg(r) for r in rows]
+
+
+def _openai_msg(r: dict) -> dict:
+    if (r.get("role") or "assistant") == "user":
+        return {"role": "user", "content": r.get("content") or ""}
+    state = _meta_row(r).get(PROVIDER_STATE_KEY)
+    if isinstance(state, dict) and state.get("fmt") == "openai":
+        msg = state.get("message")
+        if isinstance(msg, dict):
+            rebuilt = dict(msg)
+            rebuilt.setdefault("role", "assistant")
+            return rebuilt
+    return {"role": "assistant", "content": r.get("content") or ""}
+
+
+def _anthropic_msg(r: dict) -> dict:
+    if (r.get("role") or "assistant") == "user":
+        return {"role": "user", "content": r.get("content") or ""}
+    state = _meta_row(r).get(PROVIDER_STATE_KEY)
+    if isinstance(state, dict) and state.get("fmt") == "anthropic":
+        blocks = state.get("content")
+        if isinstance(blocks, list):
+            return {"role": "assistant", "content": blocks}
+    return {"role": "assistant", "content": r.get("content") or ""}
+
+
+def strip_native_state(messages: list[dict], fmt: str) -> list[dict]:
+    """Downgrade assistant dicts to the text-only form a fresh turn can re-send.
+
+    The reconstruction retry for a `state_missing` error: the previous attempt
+    carried stale thinking/reasoning blocks, so we rebuild every assistant dict
+    with just its user-visible text and re-request. Reasoning (openai) is dropped
+    by rebuilding the dict; thinking blocks (anthropic) are filtered to `text`.
+    A dict with no surviving text is left untouched — turning a tool_use turn into
+    an empty content list would only replace one provider rejection with another.
+    """
+    out: list[dict] = []
+    for m in (messages or []):
+        if (m or {}).get("role") != "assistant":
+            out.append(m)
+            continue
+        if fmt == "anthropic":
+            blocks = m.get("content")
+            if isinstance(blocks, list):
+                text_blocks = [b for b in blocks
+                               if isinstance(b, dict) and b.get("type") == "text"]
+                if text_blocks:
+                    out.append({"role": "assistant", "content": text_blocks})
+                    continue
+        else:
+            content = m.get("content")
+            if content is not None:
+                out.append({"role": "assistant", "content": content})
+                continue
+        out.append(m)
+    return out
+
+
+def strip_null_args(args) -> dict:
+    """Drop top-level null values from a tool-call's parsed input.
+
+    Anthropic-compatible emulators (DeepSeek's, among others) validate the
+    tool_use `input` against the declared input_schema, and reject an OPTIONAL
+    prop sent as `null` ("null is not of type 'array'") even though omitting the
+    key entirely is legal in every schema. Absent key < null key, always. The
+    executed copy keeps what the model sent; only the wire copy is sanitized.
+    """
+    if not isinstance(args, dict):
+        return args
+    return {k: v for k, v in args.items() if v is not None}
+
+
+def anthropic_assistant_content(result: dict) -> list[dict]:
+    """Assistant content blocks that satisfy Anthropic's alternation rules.
+
+    *result* is a normalised `call_anthropic` dict. Some Anthropic-compatible
+    emulators return the tool-use turn in a shape the real API would reject: a
+    `text` block AFTER a `tool_use` block, or `tool_use` blocks missing from
+    `content` while `tool_calls` is parsed. The server then fails the NEXT user
+    message with "Each tool_result block must have a corresponding tool_use block
+    in the previous message." This rebuilds the blocks exactly as the API
+    requires: text first, then EVERY tool_use (synthesised from `tool_calls` when
+    the raw payload lacks them), inputs stripped of top-level nulls, and nothing
+    else — so a `tool_result`'s id is always matched two messages down.
+    """
+    blocks = result.get("raw_content") or []
+    if not isinstance(blocks, list):
+        blocks = []
+    tool_uses = {}
+    for tc in (result.get("tool_calls") or []):
+        if tc.get("id"):
+            tool_uses[tc["id"]] = tc
+    kept: list[dict] = []
+    order: list[str] = []
+    mapped: dict[str, dict] = {}
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "text":
+            kept.append({"type": "text", "text": b.get("text") or ""})
+        elif btype == "tool_use":
+            tid = b.get("id", "")
+            tc = tool_uses.get(tid)
+            if tc:
+                order.append(tid)
+                mapped[tid] = {"type": "tool_use", "id": tid,
+                               "name": tc.get("name", ""),
+                               "input": strip_null_args(tc.get("args"))}
+            elif tid and b.get("name"):
+                order.append(tid)
+                mapped[tid] = dict(b)
+    for tid, tc in tool_uses.items():
+        if not tc.get("name"):
+            continue
+        if tid not in mapped:
+            order.append(tid)
+            mapped[tid] = {"type": "tool_use", "id": tid,
+                           "name": tc["name"],
+                           "input": strip_null_args(tc.get("args"))}
+    uses = [mapped[tid] for tid in order if tid in mapped]
+    rebuilt = kept + uses
+    if rebuilt:
+        return rebuilt
+    return [{"type": "text", "text": (result.get("text") or "") or ""}]
+
+
+# ── Feed repair — no dangling tool round-trip ever reaches the wire ─────────────
+#
+# The loops already build feeds with correct tool_use↔tool_result /
+# tool_calls↔role:tool pairing; this is the safety net for a feed handed over
+# from a resumed turn or a partially-drained batch. Anthropic-compatible
+# endpoints reject pairings that are not (a) a tool_result message sitting one
+# after the assistant message carrying its tool_use, and (b) an assistant tool_use
+# answered before the turn ends. OpenAI rejects role 'tool' messages without a
+# preceding declaration.
+
+def is_tool_call_text(text: str | None) -> bool:
+    """True when a reply is a tool invocation DUMPED AS PLAIN TEXT.
+
+    Some endpoints/models answer by emitting the function call as a text block —
+    Claude-Code style `<invoke name="...">…</invoke>` markup, or its mangled
+    fullwidth-bar paste artifact (`｜｜ 大臣 ｜｜ invoke name="update_todo">…`) —
+    instead of returning a real `tool_use`/`tool_calls` block. Saved verbatim,
+    that block becomes this turn's "final answer", it poisons history, and the
+    next turn's feed starts accumulating the rejection spiral. The loops detect
+    it and re-ask text-only, exactly like a blank reply.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    return any(
+        m in text or m in low
+        for m in ("<invoke name=", "\uff5c", "<function_calls>",
+                  "parameter name=", '"tool_calls": [')
+    )
+
+
+# The wrapper around a textual call is unstable across models: the bare
+# "<invoke name=...>" of Claude-Code, and DeepSeek's "|DSML| invoke ..." paste
+# artifact where the bars are fullwidth characters. Only the words matter, so the
+# patterns below key on "invoke name=" and "parameter name=" and tolerate
+# anything in front of them.
+_TEXTUAL_INVOKE_RE = re.compile(r'invoke\s+name\s*=\s*"([^"]+)"', re.I)
+_TEXTUAL_PARAM_RE = re.compile(
+    r'parameter\s+name\s*=\s*"([^"]+)"[^>]*>(.*?)'
+    r'(?=parameter\s+name\s*=|invoke\s+name\s*=|</[^>]*parameter>|</?[^>]*calls>|$)',
+    re.I | re.S,
+)
+
+
+def _parse_textual_value(raw: str):
+    """A textual parameter's value: JSON when it parses, else the raw string."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def parse_textual_tool_calls(text: str | None) -> list[dict]:
+    """Recover structured tool calls a model emitted AS TEXT.
+
+    DeepSeek and some proxies answer a tool-using turn with the call wrapped in
+    plain text instead of a real tool_calls/tool_use block:
+
+        Empty workspace - I'll build this from scratch...
+        |DSML| calls> |DSML| invoke name="update_todo">
+        |DSML| parameter name="todos" string="true">[...]</|DSML| parameter>
+        </invoke>
+
+    Re-asking (the old behaviour) frequently just produces the same text again,
+    which is how a turn ends as "I didn't produce a reply" with nothing done. This
+    turns the text into the calls it plainly represents so the loop can RUN them.
+    Returns [] when there is no invoke/parameter structure to read, so a message
+    that merely mentions a tool name is never mistaken for a call.
+    """
+    if not text:
+        return []
+    invokes = list(_TEXTUAL_INVOKE_RE.finditer(text))
+    if not invokes:
+        return []
+    calls: list[dict] = []
+    for i, m in enumerate(invokes):
+        name = m.group(1).strip()
+        if not name:
+            continue
+        start = m.end()
+        end = invokes[i + 1].start() if i + 1 < len(invokes) else len(text)
+        body = text[start:end]
+        args = {pm.group(1).strip(): _parse_textual_value(pm.group(2))
+                for pm in _TEXTUAL_PARAM_RE.finditer(body)}
+        calls.append({"id": "call_text_" + uuid.uuid4().hex[:12],
+                      "name": name, "args": args})
+    return calls
+
+
+def adopt_textual_tool_calls(result: dict) -> dict:
+    """Promote a result whose tool call arrived as text into a real one.
+
+    A no-op unless the result has no structured calls AND its text looks like a
+    textual call AND at least one invoke parses. The native payload is cleared so
+    the loops rebuild the assistant turn from the recovered calls rather than
+    replaying the raw markup (which is what poisons history). Any visible prose
+    that preceded the call is kept as the assistant message's content.
+    """
+    if not isinstance(result, dict) or result.get("tool_calls"):
+        return result
+    text = result.get("text") or ""
+    if not is_tool_call_text(text):
+        return result
+    parsed = parse_textual_tool_calls(text)
+    if not parsed:
+        return result
+    out = dict(result)
+    out["tool_calls"] = parsed
+    out["raw_assistant"] = None
+    out["raw_content"] = []
+    return out
+
+
+def repair_feed(messages: list[dict], fmt: str) -> list[dict]:
+    """Make a feed satisfy the provider's tool-call pairing rules, or drop it.
+
+    Idempotent and cheap; run on the assembled feed right before a provider call.
+    Both wire formats demand that every tool call be answered IMMEDIATELY and
+    COMPLETELY by the next message(s), and every format phrases the failure as a
+    whole-request 400 that reads like the model's fault:
+
+        OpenAI/AgentRouter: "An assistant message with 'tool_calls' must be
+            followed by tool messages responding to each 'tool_call_id'."
+        Anthropic-compatible: "`tool_use` ids were found without `tool_result`
+            blocks immediately after …"
+
+    ⚠️ THE OLD OPENAI REPAIR LOOKED AT `out[-1]` FOR THE DECLARATION, WHICH IS
+    ONLY THE ASSISTANT MESSAGE FOR THE *FIRST* OF A PARALLEL BATCH. A response
+    that returns two tool calls appends two `role: tool` replies; the second
+    then saw the first tool message as its "preceding assistant", matched
+    nothing, and was silently dropped — leaving one tool_call unanswered and
+    failing every multi-tool turn. That is why this tracks the outstanding ids
+    across a consecutive run of tool messages instead of peeking at one row.
+
+    A call that never gets answered is STRIPPED from its assistant message (with
+    the whole message removed if that leaves it empty), because keeping the call
+    and dropping its result is the same dangling half from the other side.
+    """
+    if fmt == "anthropic":
+        return _repair_feed_anthropic(messages)
+    return _repair_feed_openai(messages)
+
+
+def _strip_openai_tool_calls(msg: dict, ids: set) -> bool:
+    """Remove the still-unanswered `tool_calls` from *msg*. True if it is now empty."""
+    tcs = msg.get("tool_calls")
+    if isinstance(tcs, list):
+        kept = [tc for tc in tcs
+                if not (isinstance(tc, dict) and tc.get("id") in ids)]
+        if kept:
+            msg["tool_calls"] = kept
+        else:
+            msg.pop("tool_calls", None)
+    return not msg.get("content") and not msg.get("tool_calls")
+
+
+def _repair_feed_openai(messages: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    pending_at: int | None = None   # index in `out` of the declaring assistant
+    pending: set = set()
+
+    def _flush() -> None:
+        nonlocal pending_at, pending
+        if pending_at is not None and pending_at < len(out):
+            if _strip_openai_tool_calls(out[pending_at], pending):
+                del out[pending_at]
+        pending_at, pending = None, set()
+
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            _flush()
+            ids = {tc.get("id") for tc in (m.get("tool_calls") or [])
+                   if isinstance(tc, dict) and tc.get("id")}
+            if ids:
+                m = dict(m)          # copy so stripping never edits the caller's dict
+                out.append(m)
+                pending_at, pending = len(out) - 1, set(ids)
+            else:
+                out.append(m)
+        elif role == "tool":
+            tcid = m.get("tool_call_id")
+            if tcid and tcid in pending:
+                out.append(m)
+                pending.discard(tcid)
+                if not pending:
+                    pending_at = None
+            # else: an orphaned tool message answers no live call — drop it.
+        else:
+            _flush()
+            out.append(m)
+    _flush()
+    return out
+
+
+def _strip_anthropic_tool_use(msg: dict, ids: set) -> bool:
+    """Remove the still-unanswered `tool_use` blocks from *msg*; True if empty."""
+    blocks = msg.get("content")
+    if isinstance(blocks, list):
+        kept = [b for b in blocks
+                if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                        and b.get("id") in ids)]
+        if kept:
+            msg["content"] = kept
+            return False
+        return True
+    return False
+
+
+def _repair_feed_anthropic(messages: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    pending_at: int | None = None
+    pending: set = set()
+
+    def _flush() -> None:
+        nonlocal pending_at, pending
+        if pending_at is not None and pending_at < len(out):
+            if _strip_anthropic_tool_use(out[pending_at], pending):
+                del out[pending_at]
+        pending_at, pending = None, set()
+
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "assistant":
+            _flush()
+            blocks = m.get("content")
+            ids = ({b.get("id") for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")}
+                   if isinstance(blocks, list) else set())
+            if ids:
+                m = dict(m)
+                m["content"] = list(blocks)   # copy: stripping must not edit the caller
+                out.append(m)
+                pending_at, pending = len(out) - 1, set(ids)
+            else:
+                out.append(m)
+        elif role == "user":
+            blocks = m.get("content")
+            results = ([b for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "tool_result"]
+                       if isinstance(blocks, list) else [])
+            if not results:
+                _flush()
+                out.append(m)
+                continue
+            kept = [b for b in results if b.get("tool_use_id") in pending]
+            if kept:
+                non_results = [b for b in blocks
+                               if not (isinstance(b, dict)
+                                       and b.get("type") == "tool_result")]
+                m = dict(m)
+                m["content"] = non_results + kept
+                out.append(m)
+                pending -= {b.get("tool_use_id") for b in kept}
+                if not pending:
+                    pending_at = None
+            else:
+                # Every result answered a call that is no longer live. Preserve
+                # any text this user message carried, then close the dangling call.
+                non_results = [b for b in blocks
+                               if not (isinstance(b, dict)
+                                       and b.get("type") == "tool_result")]
+                if non_results:
+                    out.append({"role": "user", "content": non_results})
+            if pending:
+                _flush()
+        else:
+            _flush()
+            out.append(m)
+    _flush()
+    return out
+
+
+# ── Error normalization ──────────────────────────────────────────────────────────
+# Providers surface failures through different envelopes (OpenAI nests everything
+# under `error`, Anthropic tags a `type` on the envelope itself); callers that
+# only ever see a message string lose the code/parameter that actually diagnoses
+# a 400. `normalize_provider_error` flattens any failure into one canonical shape
+# for the ledger, logs and user hints.
+
+
+def _parse_error_body(body: str) -> dict:
+    try:
+        data = json.loads(body) if isinstance(body, str) else (body or {})
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    err = data.get("error")
+    if isinstance(err, dict):
+        return {"message": str(err.get("message") or ""),
+                "error_type": str(err.get("type") or err.get("code") or ""),
+                "parameter": str(err.get("param") or ""),
+                "provider_code": str(err.get("code") or ""),
+                "trace_id": str(err.get("trace_id") or ""),
+                "raw": data}
+    msg = str(data.get("message") or "")
+    return {"message": msg,
+            "error_type": str(data.get("type") or ""),
+            "parameter": str(data.get("param") or ""),
+            "provider_code": str(data.get("code") or ""),
+            "trace_id": str(data.get("trace_id") or ""),
+            "raw": data}
+
+
+def normalize_provider_error(exc) -> dict:
+    """Flatten any failure into canonical fields for the ledger and hints.
+
+    Returns a dict with `status_code`, `url`, `message`, `error_type`,
+    `parameter`, `provider_code`, `trace_id`. Non-HTTP exceptions get a minimal
+    shape with their stringified message and their own type name, so every
+    caller can read the SAME fields off any failure.
+    """
+    if isinstance(exc, ProviderHTTPError):
+        params = _parse_error_body(exc.body)
+        return {"status_code": exc.status,
+                "url": exc.url,
+                "message": params.get("message") or str(exc),
+                "error_type": params.get("error_type") or "",
+                "parameter": params.get("parameter") or "",
+                "provider_code": params.get("provider_code") or "",
+                "trace_id": params.get("trace_id") or ""}
+    return {"status_code": None,
+            "url": "",
+            "message": str(exc),
+            "error_type": type(exc).__name__,
+            "parameter": "",
+            "provider_code": "",
+            "trace_id": ""}
 
 
 # ── Chat call — returns a normalised result ─────────────────────────────────────
@@ -468,8 +1090,22 @@ def _anthropic_tools() -> list[dict]:
 # Normalised result shape:
 #   {"text": str, "tool_calls": [{"id","name","args"}], "tokens": int}
 
+
+def _openai_max_tokens_field(model_id: str) -> str:
+    """Output-ceiling field name for an OpenAI-compatible model id.
+    Reasoning models (o1/o3/o4/gpt-5 …) reject the legacy `max_tokens` and want
+    `max_completion_tokens`; every other generation accepts `max_tokens`. Getting
+    this wrong is a hard 400 mid-turn, and it is the kind of wire-format detail
+    that decides whether a user-registered endpoint works at all.
+    """
+    text = str(model_id or "").strip().lower()
+    if any(prefix in text for prefix in ("o1", "o3", "o4", "o5", "gpt-5", "gpt-5.")):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
 def call_openai(prov: dict, messages: list[dict], system: str,
-                use_tools: bool = True) -> dict:
+                use_tools: bool = True, max_tokens: int | None = None) -> dict:
     url = _openai_chat_url(prov["base_url"])
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {prov['api_key']}",
@@ -479,6 +1115,8 @@ def call_openai(prov: dict, messages: list[dict], system: str,
                "X-Title": "Agent 2"}
     msgs = [{"role": "system", "content": system}, *messages]
     payload = {"model": prov["model_id"], "messages": msgs}
+    if max_tokens and max_tokens > 0:
+        payload[_openai_max_tokens_field(prov["model_id"])] = max_tokens
     # Omitted entirely (not sent empty) when tools are off — some gateways reject
     # an empty `tools` array. Used by the blank-reply retry to force plain text.
     if use_tools:
@@ -497,21 +1135,34 @@ def call_openai(prov: dict, messages: list[dict], system: str,
             a = {}
         tool_calls.append({"id": tc.get("id", ""), "name": fn.get("name", ""), "args": a})
     usage = data.get("usage", {}) or {}
-    return {"text": msg.get("content") or "",
+    text = msg.get("content") or ""
+    # Some reasoning models (DeepSeek's thinking mode, via proxies that keep the
+    # two channels separate) return an EMPTY `content` with the only text in
+    # `reasoning_content`. A no-tool response then looked blank and the turn ended
+    # as "I didn't produce a reply". Prefer `content`; fall back to the reasoning
+    # only when there is nothing else and no call to run.
+    if not text and not tool_calls:
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str):
+            text = reasoning.strip()
+    return {"text": text,
             "tool_calls": tool_calls,
             "tokens": usage.get("total_tokens", 0),
             "raw_assistant": msg}
 
 
 def call_anthropic(prov: dict, messages: list[dict], system: str,
-                   use_tools: bool = True) -> dict:
+                   use_tools: bool = True, max_tokens: int | None = None) -> dict:
     url = _anthropic_messages_url(prov["base_url"])
     headers = {"Content-Type": "application/json",
                "x-api-key": prov["api_key"],
                "User-Agent": (prov.get("user_agent") or "").strip() or DEFAULT_USER_AGENT,
                "anthropic-version": "2023-06-01"}
+    # Anthropic REQUIRES max_tokens. Let the caller raise it (thinking mode wants
+    # headroom); otherwise keep the long-standing default rather than a guess.
     payload = {"model": prov["model_id"], "system": system,
-               "messages": messages, "max_tokens": 8192}
+               "messages": messages,
+               "max_tokens": int(max_tokens) if (max_tokens or 0) > 0 else 8192}
     if use_tools:
         payload["tools"] = _anthropic_tools()
     data = _http_post(url, headers, payload)
@@ -531,12 +1182,18 @@ def call_anthropic(prov: dict, messages: list[dict], system: str,
 
 
 def chat(prov: dict, messages: list[dict], system: str,
-         use_tools: bool = True) -> dict:
+         use_tools: bool = True, max_tokens: int | None = None) -> dict:
     """Dispatch to the right wire format. `prov` is a full DB row (with api_key).
 
     Pass `use_tools=False` to ask for a plain-text answer with no tool schemas
     attached — the agent loops use this to recover from a blank reply.
+
+    Pass `max_tokens` to cap/raise the output ceiling (e.g. thinking mode). None
+    keeps the provider default (OpenAI sends nothing; Anthropic falls back to its
+    long-standing 8192).
     """
     if prov.get("format") == "anthropic":
-        return call_anthropic(prov, messages, system, use_tools=use_tools)
-    return call_openai(prov, messages, system, use_tools=use_tools)
+        return call_anthropic(prov, messages, system, use_tools=use_tools,
+                              max_tokens=max_tokens)
+    return call_openai(prov, messages, system, use_tools=use_tools,
+                       max_tokens=max_tokens)

@@ -711,7 +711,7 @@ def run_agent(
             candidate = resp.candidates[0] if resp.candidates else None
             if not candidate or not candidate.content:
                 fr = getattr(candidate, "finish_reason", "?") if candidate else "none"
-                status_line(f"Empty response (finish_reason={fr}). Try /model 2.5-flash", "warning")
+                status_line(f"Empty response (finish_reason={fr}). Try /model {DEFAULT_MODEL}", "warning")
                 return history
             parts = candidate.content.parts or []
         except Exception as ex:
@@ -719,10 +719,18 @@ def run_agent(
             return history
 
         func_calls: list = []
+        #: Parallel to `func_calls`: Gemini 3 requires the `thought_signature`
+        #: that arrived with each call to be handed back when the call is
+        #: replayed, or the NEXT request fails with "Function call is missing a
+        #: thought_signature". Captured from the SAME part, so the pairing cannot
+        #: slip; `None` for older/non-thinking models that send none.
+        func_sigs: list = []
         texts:      list = []
         for p in parts:
             try:
-                if p.function_call and p.function_call.name: func_calls.append(p.function_call)
+                if p.function_call and p.function_call.name:
+                    func_calls.append(p.function_call)
+                    func_sigs.append(getattr(p, "thought_signature", None))
                 elif p.text and not getattr(p, "thought", False): texts.append(p.text)
             except Exception: pass
 
@@ -756,7 +764,8 @@ def run_agent(
             # what stops a fallback model from re-issuing them. See `_TurnState`.
             state.tools_ran = True
             context.append(gtypes.Content(role="model",
-                parts=[gtypes.Part(function_call=fc) for fc in func_calls]))
+                parts=[gtypes.Part(function_call=fc, thought_signature=sig)
+                       for fc, sig in zip(func_calls, func_sigs)]))
             tool_result_parts = []
 
             for fc in func_calls:
@@ -1428,12 +1437,16 @@ def run_provider_agent_cli(user_msg: str, history: list, pid: str,
         # cost the user their MCP tools.
         _mcp_bridges = _mcp_registry.extra_bridges() if (_MCP_OK and _mcp_registry) else []
 
-        # Seed provider messages from text history. Same `MAX_CTX_MESSAGES` bound as
-        # the Gemini path above and as `agent.build_context()` — switching provider
-        # must not change how much of the conversation the model is shown.
-        messages = [{"role": ("user" if h["role"] == "user" else "assistant"),
-                     "content": h["content"]}
-                    for h in history[-_cfg.MAX_CTX_MESSAGES:] if h["role"] in ("user", "assistant")]
+        # Seed provider messages from history. ⚠️ NOT A TEXT-ONLY SEED: reasoning
+        # models reject a history that lost their previous reply's thinking, so
+        # `providers.history_messages` restores the opaque native assistant
+        # payloads saved under `meta.provider_state`. Same `MAX_CTX_MESSAGES`
+        # bound as the Gemini path above and as `agent.build_context()` — switching
+        # provider must not change how much of the conversation the model is shown.
+        rows = [{"role": h["role"], "content": h["content"], "meta": h.get("meta")}
+                for h in history[-_cfg.MAX_CTX_MESSAGES:]
+                if h["role"] in ("user", "assistant")]
+        messages: list[dict] = _prov.history_messages(rows, fmt)
         # Swap the enhanced copy in for the just-appended original user turn so the
         # provider sees the PIL-improved prompt while history keeps the original.
         if send_msg and send_msg != user_msg and messages and messages[-1]["role"] == "user":
@@ -1464,6 +1477,10 @@ def run_provider_agent_cli(user_msg: str, history: list, pid: str,
         )
         state = _TurnState(fmt, messages=messages, system=system)
 
+    # One reconstruction retry per turn, exactly as the web provider loop does:
+    # a `state_missing` reply means the history lost the model's own thinking,
+    # and the only fix is to strip the stale blocks and ask once more.
+    _state_rebuilt = False
     for _ in range(MAX_AGENT_ITERS):
         if cancelled():
             status_line("Cancelled.", "warning")
@@ -1472,9 +1489,25 @@ def run_provider_agent_cli(user_msg: str, history: list, pid: str,
         spin.start()
         ux.progress_stages.set_stage("Calling Model")
         try:
+            # Same feed-repair as the web loop: a resumed turn or partial batch
+            # must never hand the provider an orphaned tool round-trip.
+            messages = _prov.repair_feed(messages, fmt)
             result = _prov.chat(prov, messages, system)
         except Exception as exc:
             spin.stop()
+            kind = _classify_net_error(exc)
+            if kind == "state_missing" and not _state_rebuilt:
+                _state_rebuilt = True
+                messages = _prov.strip_native_state(messages, fmt)
+                continue
+            if kind == "schema":
+                # A rejected tool schema is a build-time defect in OUR
+                # declaration, sent identically on every call — falling back to
+                # another model would spend quota to reach the same 400.
+                status_line("Provider rejected one of Agent2's tool schemas "
+                            "(Agent2 build defect, not your request) — update "
+                            "Agent2.", "error")
+                return history
             reason = _classify_model_error(str(exc))
             if reason:
                 # Let agent_turn fall back to another model, on the turn as it
@@ -1491,6 +1524,11 @@ def run_provider_agent_cli(user_msg: str, history: list, pid: str,
             status_line("Cancelled.", "warning")
             return history
 
+        # Recover a call the model emitted as TEXT (DeepSeek's "|DSML| invoke ...",
+        # the Claude-Code "<invoke ...>" shape) and RUN it, rather than dead-ending
+        # as a blank/filler reply. No-op for a structured call.
+        result = _prov.adopt_textual_tool_calls(result)
+
         total = result.get("tokens", 0)
         _metrics.tokens("custom:" + str(pid or ""), total)
         if total:
@@ -1499,29 +1537,53 @@ def run_provider_agent_cli(user_msg: str, history: list, pid: str,
 
         if not tool_calls:
             final = (result.get("text") or "").strip()
+            # A tool call emitted as TEXT (Claude-Code `<invoke name=…>` markup or
+            # the mangled ｜｜ paste artifact) is a blank-like failure: persisted
+            # verbatim it poisons history and the next turns spiral. Treat it the
+            # same way — retry text-only, and never persist its native payload
+            # (the re-ask's r2 is what we do not hold either).
+            _structural = _prov.is_tool_call_text(final)
+            entry_state = (_prov.assistant_state(result)
+                           if not (_is_blank_reply(final) or _structural) else None)
             # Same blank-reply guard as the Gemini loop: retry once with no tool
             # schemas attached before falling back to an honest notice, so a bare
             # "hi" can never come back as a placeholder "Done.".
-            if _is_blank_reply(final):
+            if _is_blank_reply(final) or _structural:
                 if cancelled():
                     status_line("Cancelled.", "warning")
                     return history
                 try:
                     r2 = _prov.chat(prov, messages, system, use_tools=False)
                     t2 = (r2.get("text") or "").strip()
-                    final = t2 if not _is_blank_reply(t2) else _blank_reply_notice()
+                    if _structural:
+                        final = (t2 if (t2 and not _prov.is_tool_call_text(t2))
+                                 else "The model returned its tool call as text "
+                                      "instead of calling it. Please try again — "
+                                      "nothing ran.")
+                    else:
+                        final = t2 if not _is_blank_reply(t2) else _blank_reply_notice()
                 except Exception:
                     final = _blank_reply_notice()
             print_agent_reply(final)
-            history.append({"role": "assistant", "content": final,
-                            "ts": datetime.now().isoformat()})
+            entry = {"role": "assistant", "content": final,
+                     "ts": datetime.now().isoformat()}
+            if entry_state is not None:
+                entry["meta"] = {_prov.PROVIDER_STATE_KEY: entry_state}
+            history.append(entry)
             return history
 
         # ⚠️ Latched before the first tool runs, for `run_agent`'s reason: a cancel
         # or a raise mid-batch still leaves side effects on disk.
         state.tools_ran = True
         if fmt == "anthropic":
-            messages.append({"role": "assistant", "content": result.get("raw_content", [])})
+            # Rebuilt by the adapter: some Anthropic-compat emulators return text
+            # AFTER tool_use (or drop tool_use from raw_content), and the server
+            # then rejects our next tool_result as orphaned. The adapter
+            # reorders/synthesises so every tool_result's id is matched two
+            # messages down, and strips null inputs emulators reject even though
+            # the schema allows the absent key.
+            messages.append({"role": "assistant",
+                             "content": _prov.anthropic_assistant_content(result)})
             tr = []
             for tc in tool_calls:
                 if cancelled():
@@ -1532,12 +1594,33 @@ def run_provider_agent_cli(user_msg: str, history: list, pid: str,
                            "content": out or "(no output)"})
             messages.append({"role": "user", "content": tr})
         else:
-            messages.append(result.get("raw_assistant") or {
-                "role": "assistant", "content": result.get("text", ""),
-                "tool_calls": [{"id": tc["id"], "type": "function",
-                                "function": {"name": tc["name"],
-                                             "arguments": json.dumps(tc["args"])}}
-                               for tc in tool_calls]})
+            raw_assistant = result.get("raw_assistant")
+            if isinstance(raw_assistant, dict):
+                rebuilt = {"role": "assistant",
+                           "content": raw_assistant.get("content") or result.get("text", "")}
+                call_rows = []
+                for tc_row in (raw_assistant.get("tool_calls") or []):
+                    if not isinstance(tc_row, dict):
+                        continue
+                    fn = tc_row.get("function")
+                    if isinstance(fn, dict):
+                        try:
+                            args = json.loads(fn.get("arguments") or "{}")
+                        except Exception:
+                            args = {}
+                        fn = {**fn, "arguments": json.dumps(_prov.strip_null_args(args))}
+                        tc_row = {**tc_row, "function": fn}
+                    call_rows.append(tc_row)
+                if call_rows:
+                    rebuilt["tool_calls"] = call_rows
+                messages.append(rebuilt)
+            else:
+                messages.append({"role": "assistant", "content": result.get("text", ""),
+                                 "tool_calls": [
+                                     {"id": tc["id"], "type": "function",
+                                      "function": {"name": tc["name"],
+                                                   "arguments": json.dumps(tc["args"])}}
+                                     for tc in tool_calls]})
             for tc in tool_calls:
                 if cancelled():
                     status_line("Cancelled.", "warning")

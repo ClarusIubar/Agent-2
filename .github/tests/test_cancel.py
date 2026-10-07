@@ -735,6 +735,7 @@ def test_a_stop_mid_batch_abandons_the_rest_of_the_tools(monkeypatch, fmt):
 
     from agent2.database import exe, init_db
     from agent2.llm import provider_agent as PA
+    from agent2.llm import providers as _providers
 
     init_db()
     cid = f"cancel-batch-{fmt}-{uuid.uuid4().hex[:8]}"
@@ -744,10 +745,20 @@ def test_a_stop_mid_batch_abandons_the_rest_of_the_tools(monkeypatch, fmt):
              for i in range(4)]
     reply = {"tokens": 7, "tool_calls": batch, "text": "",
              "raw_content": [], "raw_assistant": None}
-
     monkeypatch.setattr(PA, "providers", SimpleNamespace(
         get_provider=lambda _pid: {"id": "p1", "format": fmt, "model_id": "m"},
-        chat=lambda *a, **k: reply))
+        chat=lambda *a, **k: reply,
+# Adapter helpers are pure and part of the seed/repair contract the
+    # loop now calls — keep the REAL ones, not a second simulation.
+    PROVIDER_STATE_KEY=_providers.PROVIDER_STATE_KEY,
+    history_messages=_providers.history_messages,
+    strip_native_state=_providers.strip_native_state,
+    assistant_state=_providers.assistant_state,
+    anthropic_assistant_content=_providers.anthropic_assistant_content,
+    strip_null_args=_providers.strip_null_args,
+    repair_feed=_providers.repair_feed,
+    is_tool_call_text=_providers.is_tool_call_text,
+    adopt_textual_tool_calls=_providers.adopt_textual_tool_calls))
     monkeypatch.setattr(PA, "mcp_registry", SimpleNamespace(
         extra_bridges=lambda: [], ensure_connected=lambda *a, **k: None))
     monkeypatch.setattr(PA, "burp", SimpleNamespace(
