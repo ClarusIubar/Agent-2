@@ -26,6 +26,7 @@ Layer: env / models / state → store.
 """
 
 from pathlib import Path
+import json
 
 from agent2.cli.env import _CORE_OK, _DB_OK, _core_memory, _core_rules, _db_exe, _db_qall
 from agent2.cli.models import DEFAULT_MODE, DEFAULT_MODEL, MODELS
@@ -121,13 +122,30 @@ def load_rules() -> list:
 # ── Conversation history ───────────────────────────────────────────────────────
 
 def _msgs_to_history(rows: list) -> list:
-    """Convert stored message rows into the CLI's in-memory history shape."""
+    """Convert stored message rows into the CLI's in-memory history shape.
+
+    The optional `meta` column is carried through WHEN present — the
+    custom-provider loops save an opaque `provider_state` blob there (thinking /
+    reasoning blocks) and need it back to seed the next turn. The key is simply
+    absent otherwise, so older rows and older schemas keep their exact shape.
+    """
     hist = []
     for r in rows:
         role = r.get("role")
         if role in ("user", "assistant"):
-            hist.append({"role": role, "content": r.get("content", ""),
-                         "ts": r.get("created_at", "")})
+            entry = {"role": role, "content": r.get("content", ""),
+                     "ts": r.get("created_at", "")}
+            meta = r.get("meta")
+            if isinstance(meta, dict):
+                entry["meta"] = meta
+            elif isinstance(meta, str) and meta:
+                try:
+                    parsed = json.loads(meta)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    entry["meta"] = parsed
+            hist.append(entry)
     return hist
 
 
@@ -191,7 +209,7 @@ def _history_for(chat: dict) -> list:
     """
     try:
         rows = _db_qall(
-            "SELECT role, content, created_at FROM messages "
+            "SELECT role, content, created_at, meta FROM messages "
             f"WHERE chat_id=? {_core_ctx.MSG_ORDER}", (chat["id"],))
     except Exception:
         return []
@@ -311,7 +329,8 @@ def save_history(h: list, model: str = "", mode: str = ""):
 
         import agent2.database as _adb
         cid = S.chat["id"]
-        rows = [(str(_uuid.uuid4()), cid, m["role"], m.get("content", ""))
+        rows = [(str(_uuid.uuid4()), cid, m["role"], m.get("content", ""),
+                 json.dumps(m.get("meta") or {}))
                 for m in h[-HISTORY_WINDOW:] if m.get("role") in ("user", "assistant")]
         # Auto-title from first user message. Computed BEFORE the batch so the
         # title write joins the same transaction as the messages it describes.
@@ -325,7 +344,8 @@ def save_history(h: list, model: str = "", mode: str = ""):
             _db_exe("DELETE FROM messages WHERE chat_id=?", (cid,))
             if rows:
                 _adb.exemany(
-                    "INSERT INTO messages(id, chat_id, role, content) VALUES(?,?,?,?)",
+                    "INSERT INTO messages(id, chat_id, role, content, meta) "
+                    "VALUES(?,?,?,?,?)",
                     rows)
             _db_exe("UPDATE chats SET updated_at=datetime('now') WHERE id=?", (cid,))
             if title:

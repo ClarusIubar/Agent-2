@@ -47,10 +47,14 @@ from agent2.cli.env import IS_WIN, shutil
 _FALLBACK_MODELS = {
     "2.5-flash":      "gemini-2.5-flash",
     "2.5-flash-lite": "gemini-2.5-flash-lite",
+    "2.5-pro":        "gemini-2.5-pro",
     "3.5-flash":      "gemini-3.5-flash",
     "3.5-flash-lite": "gemini-3.5-flash-lite",
+    "3.5-pro":        "gemini-3.5-pro",
     "3.6-flash":      "gemini-3.6-flash",
+    "3.6-pro":        "gemini-3.6-pro",
     "3.7-flash":      "gemini-3.7-flash",
+    "3.7-pro":        "gemini-3.7-pro",
 }
 _FALLBACK_MODES = {
     "fast":     {"icon": "⚡", "max_tokens": 2048,  "thinking": False},

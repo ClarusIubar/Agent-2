@@ -48,7 +48,36 @@ except Exception:  # google-genai not installed yet
 
 # ── Error classification ─────────────────────────────────────────────────────────
 # Categories: "transient" (retry), "quota" (rotate key), "auth" (rotate key),
-# "invalid_model" (fall back to another model), or "" (unknown → non-retryable).
+# "invalid_model" (fall back to another model), "context" (input too large — the
+# fix is a bigger window or a shorter message, so it never falls back), "safety"
+# (the provider's policy blocked content — also never the model's fault),
+# "state_missing" (thinking/reasoning state left behind — reconstruct and re-send
+# once, never fall back), "schema" (the request's JSON Schema was rejected — a
+# deterministic build-time defect in OUR tool declaration, so it is never retried,
+# never falls back, and never cools a model), or "" (unknown → non-retryable).
+
+# Provider rejected a function/tool JSON Schema. An OpenAI-compatible gateway that
+# reads a missing `required` as `null` answers
+#   Invalid schema for function 'update_project_doc': null is not of type "array"
+# The same request fails identically on every model, so retrying in place or
+# falling back would spend the user's quota to reach the same 400 — the fix is to
+# conform the schema (`providers._conform_tool_params`), not to move models.
+_SCHEMA_MARKERS = (
+    "invalid schema for function", "invalid schema", "schema validation",
+    "null is not of type", "is not of type", "failed to parse schema",
+    "tool schema", "function schema",
+)
+
+# A provider needs the PREVIOUS turn's thinking/reasoning content passed back,
+# and the request history lacks it (e.g. DeepSeek's "The content[].thinking in
+# the thinking mode must be passed back to the API."). Deterministic given the
+# history we sent, so it is never retried in place, never falls back to another
+# model (another vendor never receives this one's state), and the caller's fix
+# is to strip the stale state and re-send exactly once.
+_STATE_MISSING_MARKERS = (
+    "must be passed back", "must be passed along", "must be passed on",
+    "passed back to the api", "must be passed to the api",
+)
 
 # Substrings that indicate a temporary failure worth retrying. Read timeouts,
 # server-side 5xx, "overloaded", and connection resets all belong here — they are
@@ -57,10 +86,17 @@ _TRANSIENT_MARKERS = (
     "read operation timed out", "timed out", "timeout", "deadline exceeded",
     "503", "502", "500", "504", "unavailable", "overloaded",
     "connection reset", "connection aborted", "connection error",
-    "broken pipe", "temporarily unavailable", "try again",
+    "connection refused", "broken pipe", "temporarily unavailable", "try again",
     "econnreset", "remotedisconnected", "incompleteread",
     "internal error", "internal server error", "service unavailable",
     "the model is overloaded",
+    # Socket-level failures seen in the field database: WinSock 10054 ("forcibly
+    # closed"), 10053 ("software caused connection abort") and DNS failures.
+    # None carry the words above, so without these they classified as "" and the
+    # turn ended instead of retrying.
+    "forcibly closed", "connection closed", "10054", "10053",
+    "getaddrinfo", "name resolution", "name or service not known",
+    "nodename nor servname",
 )
 
 _QUOTA_MARKERS = (
@@ -78,37 +114,108 @@ _INVALID_MODEL_MARKERS = (
     "model_not_found", "invalid model", "is not supported",
 )
 
+# The request (or the accumulated history) is too big for this model's input
+# window. The failure is DETERMINISTIC given the prompt — it will fail identically
+# on any call, so it must never be retried in place or fall back to another model
+# with the same or smaller window; the user has to shorten the message or move to
+# a model with a bigger recorded window.
+_CONTEXT_MARKERS = (
+    "context length", "context_length", "context window", "maximum context",
+    "input token", "input_tokens", "too many tokens", "token limit",
+    "prompt is too long", "reduce the length", "make it shorter",
+    "exceeds the maximum", "exceeds max", "length exceeds", "request too large",
+)
+
+# Provider policy blocked the content (input or output). Not the model's fault
+# and not transient: a retry sends the same blocked content to the same filter.
+_SAFETY_MARKERS = (
+    "safety", "content filter", "content_filter", "blocked by", "harmful content",
+    "potential prompt", "policy", "refused to", "inappropriate",
+    # The gateway's own spellings for a blocked request.
+    "content-blocked", "content_blocked", "content blocked", "contentblocked",
+    "sensitive words", "sensitive_words", "sensitive content",
+)
+
+# A narrower subset that overrides an HTTP 5xx. Some gateways wrap a CONTENT block
+# in a 500 (seen live: "sensitive words detected" with code 500), and the numeric
+# code is checked first, so without this the block was retried as if the server
+# were merely busy — burning the backoff budget on a deterministic refusal.
+_CONTENT_BLOCK_MARKERS = (
+    "sensitive words", "sensitive_words", "sensitive content",
+    "content-blocked", "content_blocked", "content blocked", "contentblocked",
+    "content filter", "content_filter", "harmful content", "blocked by",
+)
+
 
 def classify_error(exc) -> str:
-    """Return one of: 'transient', 'quota', 'auth', 'invalid_model', or ''.
+    """Return one of: 'transient', 'quota', 'auth', 'invalid_model', 'context',
+    'safety', 'state_missing', 'schema', or ''.
 
     Order matters: quota (429) also contains no transient marker, but an
     'overloaded'/503 must be treated as transient even though some providers
     phrase it near rate-limit language. We check transient first so a
     momentarily overloaded model is retried rather than burning a key rotation.
+
+    `state_missing` is checked before the string markers for the same reason
+    order matters elsewhere: its phrases are the caller's contract with the
+    history we sent, and the reconstruction retry it unlocks is the ONLY
+    response that can succeed.
+
+    `schema` is checked before the generic transient markers too, because a
+    rejected tool schema is a deterministic defect in the request we built: it
+    must not be mistaken for a retryable hiccup just because an error body
+    happens to carry a `5xx`/`429`-looking token in a request id or trace id.
     """
     s = str(exc).lower()
 
-    # Some SDK exceptions carry a numeric .code / .status_code — prefer that.
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    # Some SDK exceptions / our own ProviderHTTPError carry a numeric
+    # .code / .status_code / .status — prefer that over string matching, so a
+    # status code is never misread from a body that happens to contain one.
+    code = (getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            or getattr(exc, "status", None))
     try:
         code = int(code) if code is not None else None
     except (TypeError, ValueError):
         code = None
-    if code in (500, 502, 503, 504):
+    # 520/522/524/530 are Cloudflare's own 5xx spellings and 408 is a request
+    # timeout — all genuinely transient.
+    if code in (408, 425, 500, 502, 503, 504, 520, 522, 524, 529, 530):
+        # ...unless the body says the provider BLOCKED the content. A 5xx is
+        # normally "ask again"; a content block is deterministic, so it must not
+        # be retried.
+        if any(m in s for m in _CONTENT_BLOCK_MARKERS):
+            return "safety"
         return "transient"
     if code == 429:
         # 429 with an explicit "overloaded" is transient; otherwise it's quota.
         return "transient" if "overloaded" in s else "quota"
     if code in (401, 403):
         return "auth"
+    if code in (413, 422):
+        # 413 (payload too large) and 422 (unprocessable) are almost always the
+        # request itself — a body past the provider's limits — so they are the
+        # "context" shape of failure rather than a random error.
+        return "context"
 
+    # Thinking/reasoning state the provider insists on receiving back. The loops
+    # strip the stale state and re-send ONCE; nothing else can satisfy it.
+    if any(m in s for m in _STATE_MISSING_MARKERS):
+        return "state_missing"
+    # A rejected tool JSON Schema is OUR request, not the model — checked ahead of
+    # the transient markers so a stray 5xx-looking token in a trace id cannot turn
+    # a deterministic 400 into pointless retries (and key rotations).
+    if any(m in s for m in _SCHEMA_MARKERS):
+        return "schema"
     if any(m in s for m in _TRANSIENT_MARKERS):
         return "transient"
     if any(m in s for m in _QUOTA_MARKERS):
         return "quota"
     if any(m in s for m in _AUTH_MARKERS):
         return "auth"
+    if any(m in s for m in _CONTEXT_MARKERS):
+        return "context"
+    if any(m in s for m in _SAFETY_MARKERS):
+        return "safety"
     if any(m in s for m in _INVALID_MODEL_MARKERS):
         return "invalid_model"
     return ""

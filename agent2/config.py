@@ -102,10 +102,14 @@ def shell_argv(cmd: str) -> list[str]:
 MODELS: dict[str, dict] = {
     "2.5-flash":      {"api": "gemini-2.5-flash",      "label": "2.5 Flash",      "group": "2.5"},
     "2.5-flash-lite": {"api": "gemini-2.5-flash-lite", "label": "2.5 Flash-Lite", "group": "2.5"},
+    "2.5-pro":        {"api": "gemini-2.5-pro",        "label": "2.5 Pro",        "group": "2.5"},
     "3.5-flash":      {"api": "gemini-3.5-flash",      "label": "3.5 Flash",      "group": "3.5"},
     "3.5-flash-lite": {"api": "gemini-3.5-flash-lite", "label": "3.5 Flash-Lite", "group": "3.5"},
-    "3.6-flash":      {"api": "gemini-3.6-flash",           "label": "3.6 Flash",      "group": "3.6"},
+    "3.5-pro":        {"api": "gemini-3.5-pro",        "label": "3.5 Pro",        "group": "3.5"},
+    "3.6-flash":      {"api": "gemini-3.6-flash",      "label": "3.6 Flash",      "group": "3.6"},
+    "3.6-pro":        {"api": "gemini-3.6-pro",        "label": "3.6 Pro",        "group": "3.6"},
     "3.7-flash":      {"api": "gemini-3.7-flash",      "label": "3.7 Flash",      "group": "3.7"},
+    "3.7-pro":        {"api": "gemini-3.7-pro",        "label": "3.7 Pro",        "group": "3.7"},
 }
 DEFAULT_MODEL = "2.5-flash"
 
@@ -130,7 +134,8 @@ MODES: dict[str, dict] = {
     },
     "thinking": {
         "label": "Thinking", "icon": "🧠",
-        "desc": "Deep reasoning via extended thinking (2.5/3.5 models only)",
+        "desc": "Deep reasoning via extended thinking — a thinking budget is sent to "
+                "every model group (all Gemini groups support it)",
         "max_tokens": 16384, "thinking": True, "thinking_budget": 8000,
     },
 }
